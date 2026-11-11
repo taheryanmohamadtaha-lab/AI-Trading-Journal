@@ -13,7 +13,7 @@ def main():
     app = QApplication(sys.argv)
     app.setLayoutDirection(Qt.RightToLeft)
     app.setFont(QFont("Segoe UI", 10))
-    win = MainWindow(Database(data_dir / "journal.db"))
+    win = MainWindow(Database(data_dir / "journal.db"), data_dir / "images", data_dir)
     win.show()
     sys.exit(app.exec())
 

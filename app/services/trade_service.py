@@ -1,6 +1,7 @@
 """Turns raw form input into a validated trade record.
 All numbers come from app.core.calculations (never from AI)."""
 from __future__ import annotations
+import json
 from decimal import Decimal, InvalidOperation
 from app.core import calculations as C
 
@@ -18,6 +19,22 @@ def parse_number(text, name: str, required: bool = True):
         return Decimal(s)
     except InvalidOperation:
         raise ValueError(f"مقدار «{name}» عدد معتبر نیست.")
+
+
+BEHAVIOR_FLAGS = ("fomo", "revenge", "rushed", "early_exit", "moved_sl")
+BEHAVIOR_KEYS = ("followed_plan", "mood") + BEHAVIOR_FLAGS + ("entry_reason", "lesson")
+
+
+def behavior_from_form(f: dict) -> dict:
+    out = {"followed_plan": None if f.get("followed_plan") in (None, "") else int(bool(int(f["followed_plan"]))),
+           "mood": None if f.get("mood") in (None, "") else int(f["mood"]),
+           "entry_reason": (f.get("entry_reason") or "").strip() or None,
+           "lesson": (f.get("lesson") or "").strip() or None}
+    if out["mood"] is not None and not 1 <= out["mood"] <= 5:
+        raise ValueError("وضعیت روحی باید بین ۱ تا ۵ باشد.")
+    for k in BEHAVIOR_FLAGS:
+        out[k] = int(bool(int(f.get(k) or 0)))
+    return out
 
 
 def build_trade(f: dict) -> dict:
@@ -100,4 +117,27 @@ def build_trade(f: dict) -> dict:
         "fees": float(fees), "pnl": fl(pnl), "risk_amount": fl(risk),
         "r_multiple": fl(rm), "notes": f.get("notes") or None,
         "data_source": f.get("data_source", "manual"),
+        "close_reason": f.get("close_reason") if closed else None,
+        **behavior_from_form(f),
+        # raw inputs, so an open trade can be closed later with the same settings
+        "params": json.dumps({k: str(v) for k, v in f.items() if v not in (None, "")
+                              and k not in ("exit_price", "closed_at", "close_reason") + BEHAVIOR_KEYS},
+                             ensure_ascii=False),
     }
+
+
+def close_open_trade(db, trade_id: int, exit_price, closed_at: str, reason: str = "manual") -> dict:
+    """Close a previously saved open trade; P/L is recomputed by the core."""
+    row = db.get_trade(trade_id)
+    if row is None:
+        raise ValueError("معامله پیدا نشد.")
+    if row["status"] == "closed":
+        raise ValueError("این معامله قبلاً بسته شده است.")
+    if not row.get("params"):
+        raise ValueError("این معامله اطلاعات لازم برای محاسبه‌ی خودکار ندارد "
+                         "(احتمالاً از CSV وارد شده). آن را حذف و دوباره ثبت کنید.")
+    form = json.loads(row["params"])
+    form.update(exit_price=exit_price, closed_at=closed_at, close_reason=reason)
+    built = build_trade(form)
+    db.close_trade(trade_id, built)
+    return db.get_trade(trade_id)

@@ -38,6 +38,29 @@ MIGRATIONS = [
         path TEXT NOT NULL
     );
     """,
+    """
+    ALTER TABLE trades ADD COLUMN params TEXT;
+    ALTER TABLE trades ADD COLUMN close_reason TEXT;
+    """,
+    """
+    ALTER TABLE trades ADD COLUMN followed_plan INTEGER;
+    ALTER TABLE trades ADD COLUMN mood INTEGER;
+    ALTER TABLE trades ADD COLUMN fomo INTEGER DEFAULT 0;
+    ALTER TABLE trades ADD COLUMN revenge INTEGER DEFAULT 0;
+    ALTER TABLE trades ADD COLUMN rushed INTEGER DEFAULT 0;
+    ALTER TABLE trades ADD COLUMN early_exit INTEGER DEFAULT 0;
+    ALTER TABLE trades ADD COLUMN moved_sl INTEGER DEFAULT 0;
+    ALTER TABLE trades ADD COLUMN entry_reason TEXT;
+    ALTER TABLE trades ADD COLUMN lesson TEXT;
+    CREATE TABLE goals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        metric TEXT NOT NULL,
+        op TEXT NOT NULL CHECK (op IN ('>=','<=')),
+        target REAL NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE ai_usage (day TEXT PRIMARY KEY, calls INTEGER NOT NULL DEFAULT 0);
+    """,
 ]
 
 
@@ -91,6 +114,73 @@ class Database:
             q, args = q + " WHERE market = ?", (market,)
         return [dict(r) for r in self.conn.execute(q + " ORDER BY opened_at", args)]
 
+    def get_trade(self, trade_id: int) -> dict | None:
+        r = self.conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()
+        return dict(r) if r else None
+
+    def close_trade(self, trade_id: int, fields: dict):
+        """Finish an open trade. `fields` comes from build_trade()."""
+        row = self.get_trade(trade_id)
+        if row is None:
+            raise ValueError("معامله پیدا نشد.")
+        if row["status"] == "closed":
+            raise ValueError("این معامله قبلاً بسته شده است.")
+        new = {**row, **{k: fields[k] for k in (
+            "exit_price", "closed_at", "pnl", "fees", "risk_amount",
+            "r_multiple", "close_reason") if k in fields}, "status": "closed"}
+        new["dedupe_hash"] = self.make_hash(new)
+        cols = ["exit_price", "closed_at", "pnl", "fees", "risk_amount",
+                "r_multiple", "close_reason", "status", "dedupe_hash"]
+        try:
+            with self.conn:
+                self.conn.execute(
+                    f"UPDATE trades SET {', '.join(c + ' = ?' for c in cols)} WHERE id = ?",
+                    [new.get(c) for c in cols] + [trade_id])
+        except sqlite3.IntegrityError:
+            raise ValueError("معامله‌ای با همین مشخصات قبلاً ثبت شده است.")
+
+    BEHAVIOR_COLS = ("followed_plan", "mood", "fomo", "revenge", "rushed",
+                     "early_exit", "moved_sl", "entry_reason", "lesson")
+
+    def update_behavior(self, trade_id: int, fields: dict):
+        cols = [c for c in self.BEHAVIOR_COLS if c in fields]
+        if not cols:
+            return
+        with self.conn:
+            self.conn.execute(
+                f"UPDATE trades SET {', '.join(c + ' = ?' for c in cols)} WHERE id = ?",
+                [fields[c] for c in cols] + [trade_id])
+
+    # ---- goals
+    def add_goal(self, metric: str, op: str, target: float) -> int:
+        import datetime
+        with self.conn:
+            cur = self.conn.execute("INSERT INTO goals (metric, op, target, created_at) VALUES (?,?,?,?)",
+                                    (metric, op, float(target), datetime.datetime.now().isoformat(timespec="minutes")))
+        return cur.lastrowid
+
+    def list_goals(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM goals ORDER BY id")]
+
+    def delete_goal(self, goal_id: int):
+        with self.conn:
+            self.conn.execute("DELETE FROM goals WHERE id = ?", (goal_id,))
+
+    # ---- AI usage counter (per day)
+    @staticmethod
+    def _today() -> str:
+        import datetime
+        return datetime.date.today().isoformat()
+
+    def ai_calls_today(self) -> int:
+        r = self.conn.execute("SELECT calls FROM ai_usage WHERE day = ?", (self._today(),)).fetchone()
+        return r["calls"] if r else 0
+
+    def ai_register_call(self):
+        with self.conn:
+            self.conn.execute("INSERT INTO ai_usage (day, calls) VALUES (?, 1) "
+                              "ON CONFLICT(day) DO UPDATE SET calls = calls + 1", (self._today(),))
+
     def delete_trade(self, trade_id: int, confirmed: bool = False):
         if not confirmed:
             raise PermissionError("Deletion requires explicit confirmation")
@@ -107,7 +197,9 @@ class Database:
 _TRADE_COLS = {"market", "symbol", "side", "status", "quantity", "entry_price",
                "exit_price", "stop_loss", "take_profit", "opened_at", "closed_at",
                "timeframe", "strategy", "fees", "pnl", "risk_amount",
-               "r_multiple", "notes", "data_source"}
+               "r_multiple", "notes", "data_source", "params", "close_reason",
+               "followed_plan", "mood", "fomo", "revenge", "rushed", "early_exit",
+               "moved_sl", "entry_reason", "lesson"}
 
 
 def _import_from(self, other_path) -> int:

@@ -6,10 +6,18 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QStackedWidget,
     QLabel, QFormLayout, QLineEdit, QComboBox, QPushButton, QDateTimeEdit,
     QTableWidget, QTableWidgetItem, QMessageBox, QFileDialog, QGridLayout,
-    QFrame, QPlainTextEdit, QCheckBox, QHeaderView, QAbstractItemView)
+    QFrame, QPlainTextEdit, QCheckBox, QHeaderView, QAbstractItemView, QScrollArea)
 from app.analytics.stats import compute_stats, group_stats
 from app.services.trade_service import build_trade
 from app.services import csv_io
+from app.services.image_store import ImageStore, STAGES, STAGE_LABEL
+from app.ui.trade_dialog import TradeDialog
+from app.ui.extract_page import ExtractPage
+import tempfile
+from app.ui.behavior_widget import BehaviorWidget
+from app.ui.coach_pages import CoachPage, AiSettingsPage
+from app.ai_engine.service import AiService
+from app.ai_engine.settings import SettingsStore, SecretStore
 
 MARKETS = [("فارکس", "forex"), ("ارز دیجیتال", "crypto"), ("بورس ایران", "iran")]
 FMT = "yyyy-MM-dd HH:mm"
@@ -123,9 +131,10 @@ class DashboardPage(QWidget):
 
 
 class NewTradePage(QWidget):
-    def __init__(self, db, on_saved):
+    def __init__(self, db, store, on_saved):
         super().__init__()
-        self.db, self.on_saved = db, on_saved
+        self.db, self.store, self.on_saved = db, store, on_saved
+        self.pending: list[tuple[str, str]] = []
         lay = QVBoxLayout(self)
         h = QLabel("ثبت معامله جدید"); h.setFont(QFont("Segoe UI", 20, QFont.Bold)); lay.addWidget(h)
         form = QFormLayout(); lay.addLayout(form)
@@ -163,6 +172,14 @@ class NewTradePage(QWidget):
         add("sell_fee_percent", "کارمزد فروش ٪ (بورس)", self.f["sell_fee_percent"])
         add("strategy", "استراتژی", self.f["strategy"]); add("timeframe", "تایم‌فریم", self.f["timeframe"])
         add("notes", "یادداشت", self.notes)
+        self.behavior = BehaviorWidget(); lay.addWidget(self.behavior)
+        img_row = QHBoxLayout()
+        self.img_stage = QComboBox()
+        for k, label in STAGES[:3]: self.img_stage.addItem(label, k)
+        add_img = QPushButton("افزودن عکس معامله"); add_img.clicked.connect(self.pick_image)
+        self.img_label = QLabel("بدون عکس")
+        img_row.addWidget(self.img_stage); img_row.addWidget(add_img); img_row.addWidget(self.img_label, 1)
+        lay.addLayout(img_row)
         self.hint = QLabel(""); self.hint.setWordWrap(True); self.hint.setStyleSheet("color:#8f9bb3;")
         lay.addWidget(self.hint)
         self.msg = QLabel(""); lay.addWidget(self.msg)
@@ -170,6 +187,24 @@ class NewTradePage(QWidget):
         lay.addStretch()
         self.market.currentIndexChanged.connect(self._market_changed)
         self._market_changed()
+
+    def add_pending(self, stage: str, path: str):
+        self.pending.append((stage, path))
+        self.img_label.setText("، ".join(f"{STAGE_LABEL[s]}" for s, _ in self.pending))
+
+    def pick_image(self):
+        p, _ = QFileDialog.getOpenFileName(self, "انتخاب تصویر", "", "Images (*.png *.jpg *.jpeg *.webp)")
+        if p: self.add_pending(self.img_stage.currentData(), p)
+
+    def apply_extracted(self, vals: dict, image_path: str | None):
+        """Fill the form from OCR values; the user still reviews and presses Save."""
+        if "symbol" in vals: self.symbol.setText(vals["symbol"])
+        if "side" in vals: self.side.setCurrentIndex(max(0, self.side.findData(vals["side"])))
+        for k in ("quantity", "entry_price", "exit_price", "stop_loss", "take_profit", "timeframe"):
+            if k in vals: self.f[k].setText(vals[k])
+        if image_path: self.add_pending("entry", image_path)
+        self.msg.setStyleSheet("color:#fbbf24;")
+        self.msg.setText("مقادیر از تصویر خوانده شده‌اند؛ آن‌ها را بررسی کنید، بازار را انتخاب کنید و سپس ذخیره کنید.")
 
     def _market_changed(self):
         m = self.market.currentData()
@@ -193,7 +228,7 @@ class NewTradePage(QWidget):
                     symbol=self.symbol.text(), unit=self.unit.currentData(),
                     opened_at=self.opened.dateTime().toString(FMT),
                     closed_at=self.closed.dateTime().toString(FMT),
-                    notes=self.notes.toPlainText())
+                    notes=self.notes.toPlainText(), **self.behavior.get())
         try:
             trade = build_trade(data)
             new_id = self.db.add_trade(trade)
@@ -201,10 +236,18 @@ class NewTradePage(QWidget):
             self.msg.setStyleSheet("color:#f87171;"); self.msg.setText(str(e)); return
         if new_id is None:
             self.msg.setStyleSheet("color:#fbbf24;"); self.msg.setText("این معامله قبلاً ثبت شده است."); return
+        warn = ""
+        for stage, path in self.pending:
+            try:
+                self.store.add_image(new_id, stage, path)
+            except ValueError as e:
+                warn += f" (تصویر ذخیره نشد: {e})"
+        self.pending.clear(); self.img_label.setText("بدون عکس")
         self.msg.setStyleSheet("color:#4ade80;")
-        self.msg.setText("معامله ذخیره شد." if trade["pnl"] is None
-                         else f"معامله ذخیره شد. سود/زیان محاسبه‌شده: {trade['pnl']:,.2f}")
+        self.msg.setText(("معامله ذخیره شد." if trade["pnl"] is None
+                         else f"معامله ذخیره شد. سود/زیان محاسبه‌شده: {trade['pnl']:,.2f}") + warn)
         for w in self.f.values(): w.clear()
+        self.behavior.clear()
         self.on_saved()
 
 
@@ -213,9 +256,9 @@ class ArchivePage(QWidget):
             "exit_price", "pnl", "strategy"]
     HEAD = ["شناسه", "تاریخ", "بازار", "نماد", "جهت", "حجم", "ورود", "خروج", "سود/زیان", "استراتژی"]
 
-    def __init__(self, db, on_changed):
+    def __init__(self, db, store, ai, on_changed):
         super().__init__()
-        self.db, self.on_changed = db, on_changed
+        self.db, self.store, self.ai, self.on_changed = db, store, ai, on_changed
         lay = QVBoxLayout(self)
         h = QLabel("آرشیو معاملات"); h.setFont(QFont("Segoe UI", 20, QFont.Bold)); lay.addWidget(h)
         self.table = QTableWidget(0, len(self.COLS))
@@ -224,6 +267,9 @@ class ArchivePage(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         lay.addWidget(self.table)
+        self.table.doubleClicked.connect(lambda *_: self.open_selected())
+        o = QPushButton("تصاویر / بستن معامله (دوبار کلیک روی ردیف)")
+        o.clicked.connect(lambda _=False: self.open_selected()); lay.addWidget(o)
         b = QPushButton("حذف معامله انتخاب‌شده"); b.clicked.connect(lambda _=False: self.delete_selected())
         lay.addWidget(b)
 
@@ -236,12 +282,22 @@ class ArchivePage(QWidget):
                 self.table.setItem(r, c, QTableWidgetItem("" if v is None else
                                    (f"{v:,.2f}" if k == "pnl" else str(v))))
 
-    def delete_selected(self, confirm=True):
+    def _selected_id(self):
         sel = self.table.selectionModel().selectedRows()
         row = sel[0].row() if sel else self.table.currentRow()
-        if row < 0:
+        return None if row < 0 else int(self.table.item(row, 0).text())
+
+    def open_selected(self):
+        tid = self._selected_id()
+        if tid is None:
             return
-        tid = int(self.table.item(row, 0).text())
+        TradeDialog(self.db, self.store, tid, self.on_changed, self, ai=self.ai).exec()
+        self.on_changed()
+
+    def delete_selected(self, confirm=True):
+        tid = self._selected_id()
+        if tid is None:
+            return
         if confirm and QMessageBox.question(
                 self, "تأیید حذف", f"معامله شماره {tid} حذف شود؟ این کار قابل بازگشت نیست."
         ) != QMessageBox.Yes:
@@ -331,31 +387,46 @@ class DataPage(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, db):
+    def __init__(self, db, image_dir=None, data_dir=None):
         super().__init__()
         self.db = db
+        self.store = ImageStore(db, image_dir or tempfile.mkdtemp(prefix="atj_images_"))
+        data_dir = data_dir or tempfile.mkdtemp(prefix="atj_data_")
+        self.ai = AiService(SettingsStore(data_dir), SecretStore(data_dir), db)
         self.setWindowTitle("ژورنال معاملاتی هوشمند – AI Trading Journal")
         self.resize(1150, 760)
         self.setLayoutDirection(Qt.RightToLeft)
         self.setStyleSheet(STYLE)
         self.dashboard = DashboardPage(db)
-        self.new_trade = NewTradePage(db, self.refresh_all)
-        self.archive = ArchivePage(db, self.refresh_all)
+        self.new_trade = NewTradePage(db, self.store, self.refresh_all)
+        self.extract = ExtractPage(self.send_to_form)
+        self.archive = ArchivePage(db, self.store, self.ai, self.refresh_all)
         self.stats = StatsPage(db)
+        self.coach = CoachPage(db, self.ai)
+        self.ai_settings = AiSettingsPage(self.ai)
         self.data = DataPage(db, self.refresh_all)
-        self.pages = [("داشبورد", self.dashboard), ("ثبت معامله", self.new_trade),
+        self.pages = [("داشبورد", self.dashboard), ("ثبت معامله", self.new_trade), ("ثبت از روی عکس", self.extract),
                       ("آرشیو معاملات", self.archive), ("گزارش‌های آماری", self.stats),
+                      ("مربی هوشمند", self.coach), ("تنظیمات AI", self.ai_settings),
                       ("ورود / خروج / بکاپ", self.data)]
         central = QWidget(); lay = QHBoxLayout(central)
         self.nav = QListWidget(); self.nav.setFixedWidth(210)
         self.stack = QStackedWidget()
         for name, page in self.pages:
-            self.nav.addItem(name); self.stack.addWidget(page)
+            self.nav.addItem(name)
+            if page in (self.new_trade, self.coach, self.ai_settings):
+                sc = QScrollArea(); sc.setWidgetResizable(True); sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); sc.setWidget(page); self.stack.addWidget(sc)
+            else:
+                self.stack.addWidget(page)
         self.nav.currentRowChanged.connect(self._go)
         lay.addWidget(self.nav); lay.addWidget(self.stack, 1)
         self.setCentralWidget(central)
         self.nav.setCurrentRow(0)
         self.refresh_all()
+
+    def send_to_form(self, vals, image_path):
+        self.new_trade.apply_extracted(vals, image_path)
+        self.nav.setCurrentRow(1)
 
     def _go(self, i):
         self.stack.setCurrentIndex(i)

@@ -8,7 +8,7 @@ TRADE = dict(market="forex", symbol="EURUSD", side="buy", quantity=1,
 
 def test_schema_version_and_insert():
     db = Database()
-    assert db.version == 1
+    assert db.version == 3
     assert db.add_trade(TRADE) == 1
     assert len(db.list_trades()) == 1
 
