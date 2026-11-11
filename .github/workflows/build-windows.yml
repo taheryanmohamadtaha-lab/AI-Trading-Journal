@@ -1,0 +1,40 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Run tests
+        run: python -m pytest -v
+      - name: Build EXE
+        run: pyinstaller --noconfirm --windowed --name AITradingJournal main.py
+      - name: Zip build
+        shell: pwsh
+        run: Compress-Archive -Path dist/AITradingJournal -DestinationPath AITradingJournal-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AITradingJournal-windows
+          path: AITradingJournal-windows.zip
+      - name: Attach to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: AITradingJournal-windows.zip
